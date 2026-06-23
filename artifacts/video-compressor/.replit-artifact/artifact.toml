@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Video Compressor"
+version = "1.0.0"
+id = "artifacts/video-compressor"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24256
+
+[services.development]
+run = "pnpm --filter @workspace/video-compressor run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/video-compressor", "run", "build" ]
+publicDir = "artifacts/video-compressor/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24256"
+BASE_PATH = "/"
