@@ -68,10 +68,10 @@ export default function App() {
     ffmpeg.on("log", ({ message }) => {
       console.log("[ffmpeg]", message);
     });
-    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+    const base = import.meta.env.BASE_URL;
     await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+      coreURL: await toBlobURL(`${base}ffmpeg/ffmpeg-core.js`, "text/javascript"),
+      wasmURL: await toBlobURL(`${base}ffmpeg/ffmpeg-core.wasm`, "application/wasm"),
     });
     ffmpegRef.current = ffmpeg;
     return ffmpeg;
