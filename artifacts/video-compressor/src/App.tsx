@@ -222,17 +222,77 @@ function useTool(endpoint:string,mime:string,ext:string){
   return{info,stage,progress,result,error,onFile,clear,run,cancel,setError};
 }
 
-// ── COMPRESS ──────────────────────────────────────────────────────────────────
+// ── COMPRESS (job-based polling to avoid proxy timeouts) ─────────────────────
 function CompressTool(){
   const [quality,setQuality]=useState<Quality>("medium");
-  const t=useTool("/api/compress","video/mp4","mp4");
-  const busy=t.stage==="uploading"||t.stage==="processing";
+  const [info,setInfo]=useState<VInfo|null>(null);
+  const [stage,setStage]=useState<Stage>("idle");
+  const [progress,setProgress]=useState(0);
+  const [result,setResult]=useState<Result|null>(null);
+  const [error,setError]=useState("");
+  const xhrRef=useRef<XMLHttpRequest|null>(null);
+  const pollRef=useRef<ReturnType<typeof setInterval>|null>(null);
+
+  const stopPoll=()=>{if(pollRef.current){clearInterval(pollRef.current);pollRef.current=null;}};
+
+  const onFile=(f:File)=>{
+    const url=URL.createObjectURL(f);const v=document.createElement("video");v.src=url;
+    v.onloadedmetadata=()=>setInfo({file:f,url,size:f.size,name:f.name,duration:v.duration});
+    setStage("ready");setResult(null);setError("");
+  };
+  const clear=()=>{xhrRef.current?.abort();stopPoll();setInfo(null);setStage("idle");setResult(null);setError("");};
+
+  const run=()=>{
+    if(!info)return;
+    setStage("uploading");setProgress(0);setError("");
+    const fd=new FormData();fd.append("video",info.file);fd.append("quality",quality);
+    const xhr=new XMLHttpRequest();xhrRef.current=xhr;
+    xhr.upload.onprogress=e=>{if(e.lengthComputable)setProgress(Math.round(e.loaded/e.total*100));};
+    xhr.responseType="json";
+    xhr.onload=()=>{
+      if(xhr.status===200&&xhr.response?.jobId){
+        const jobId=xhr.response.jobId as string;
+        setStage("processing");
+        // Poll until done
+        pollRef.current=setInterval(async()=>{
+          try{
+            const r=await fetch(`/api/job/${jobId}`);
+            const data=await r.json() as{status:string;originalSize:number;outputSize:number;error?:string};
+            if(data.status==="done"){
+              stopPoll();
+              // Download the result
+              const dlXhr=new XMLHttpRequest();
+              dlXhr.open("GET",`/api/job/${jobId}/download`);
+              dlXhr.responseType="arraybuffer";
+              dlXhr.onload=()=>{
+                if(dlXhr.status===200){
+                  const blob=new Blob([dlXhr.response],{type:"video/mp4"});
+                  setResult({url:URL.createObjectURL(blob),size:Number(dlXhr.getResponseHeader("X-Compressed-Size"))||blob.size,originalSize:Number(dlXhr.getResponseHeader("X-Original-Size"))||info.size,ext:"mp4",mimeType:"video/mp4"});
+                  setStage("done");
+                } else {setError("Download failed. Please try again.");setStage("ready");}
+              };
+              dlXhr.onerror=()=>{setError("Download failed. Please try again.");setStage("ready");};
+              dlXhr.send();
+            } else if(data.status==="error"){
+              stopPoll();setError(data.error||"Something went wrong.");setStage("ready");
+            }
+          }catch{/* keep polling */}
+        },2000);
+      } else {
+        setError("Something went wrong. Please try again.");setStage("ready");
+      }
+    };
+    xhr.onerror=()=>{setError("Something went wrong. Please try again.");setStage("ready");};
+    xhr.open("POST","/api/compress");xhr.send(fd);
+  };
+
+  const busy=stage==="uploading"||stage==="processing";
   return(
     <div className="space-y-5">
-      {!t.info&&<DropZone onFile={t.onFile}/>}
-      {t.info&&!busy&&t.stage!=="done"&&<>
-        <FileRow info={t.info} onClear={t.clear} busy={false}/>
-        <video src={t.info.url} controls playsInline className="w-full rounded-xl max-h-52 bg-black object-contain"/>
+      {!info&&<DropZone onFile={onFile}/>}
+      {info&&!busy&&stage!=="done"&&<>
+        <FileRow info={info} onClear={clear} busy={false}/>
+        <video src={info.url} controls playsInline className="w-full rounded-xl max-h-52 bg-black object-contain"/>
         <div>
           <p className="text-xs font-semibold text-white/25 uppercase tracking-widest mb-3">Compression Level</p>
           <div className="grid grid-cols-3 gap-2">
@@ -245,11 +305,15 @@ function CompressTool(){
             ))}
           </div>
         </div>
-        <button onClick={()=>t.run({quality})} className="btn-primary py-3.5">Compress Video</button>
+        <button onClick={run} className="btn-primary py-3.5">Compress Video</button>
       </>}
-      {busy&&<>{t.stage==="uploading"&&<UploadProgress progress={t.progress}/>}{t.stage==="processing"&&<Spinner/>}<button onClick={t.cancel} className="w-full text-center text-xs text-white/20 hover:text-white/45 transition-colors underline">Cancel</button></>}
-      {t.stage==="done"&&t.result&&t.info&&<ResultPanel result={t.result} onRedo={()=>{t.clear();}} filename={`${t.info.name.replace(/\.[^.]+$/,"")}_compressed.mp4`}/>}
-      {t.error&&<ErrorMsg msg={t.error} onDismiss={()=>t.setError("")}/>}
+      {busy&&<>
+        {stage==="uploading"&&<UploadProgress progress={progress}/>}
+        {stage==="processing"&&<Spinner/>}
+        <button onClick={()=>{xhrRef.current?.abort();stopPoll();setStage("ready");}} className="w-full text-center text-xs text-white/20 hover:text-white/45 transition-colors underline">Cancel</button>
+      </>}
+      {stage==="done"&&result&&info&&<ResultPanel result={result} onRedo={clear} filename={`${info.name.replace(/\.[^.]+$/,"")}_compressed.mp4`}/>}
+      {error&&<ErrorMsg msg={error} onDismiss={()=>setError("")}/>}
     </div>
   );
 }

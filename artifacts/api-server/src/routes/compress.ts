@@ -24,12 +24,33 @@ function cleanup(...files: string[]) {
   for (const f of files) fs.unlink(f, () => {});
 }
 
-// ── POST /api/compress ─────────────────────────────────────────────────────────
-// Streams ffmpeg output directly → response so the proxy never times out
+// In-memory job store
+interface Job {
+  status: "running" | "done" | "error";
+  outputPath?: string;
+  originalSize: number;
+  outputSize?: number;
+  basename: string;
+  error?: string;
+}
+const jobs = new Map<string, Job>();
+
+// Clean up jobs older than 10 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [id, job] of jobs) {
+    if (job.status !== "running") {
+      if (job.outputPath) cleanup(job.outputPath);
+      jobs.delete(id);
+    }
+  }
+  void cutoff;
+}, 5 * 60 * 1000);
+
+// ── POST /api/compress ── starts job, returns jobId immediately ───────────────
 router.post("/compress", (req, res) => {
   upload.single("video")(req, res, (uploadErr) => {
     if (uploadErr) {
-      req.log.warn({ err: uploadErr.message }, "upload error");
       if (!res.headersSent) res.status(400).json({ error: uploadErr.message });
       return;
     }
@@ -38,88 +59,107 @@ router.post("/compress", (req, res) => {
       return;
     }
 
-    const quality  = (req.body.quality as string) ?? "medium";
-    const crf      = CRF[quality] ?? CRF.medium;
-    const inputPath = req.file.path;
+    const quality    = (req.body.quality as string) ?? "medium";
+    const crf        = CRF[quality] ?? CRF.medium;
+    const inputPath  = req.file.path;
+    const outputPath = path.join(os.tmpdir(), `vc-out-${randomUUID()}.mp4`);
+    const jobId      = randomUUID();
+    const basename   = path.basename(req.file.originalname, path.extname(req.file.originalname));
 
-    // Pipe ffmpeg stdout → HTTP response using fragmented MP4
-    // -movflags frag_keyframe+empty_moov allows streaming without knowing size up-front
+    jobs.set(jobId, { status: "running", originalSize: req.file.size, basename });
+
+    // Return job ID immediately — client will poll
+    res.json({ jobId });
+
     const ff = spawn("ffmpeg", [
-      "-y",
-      "-i", inputPath,
+      "-y", "-i", inputPath,
       "-vcodec", "libx264",
       "-crf", crf,
-      "-preset", "ultrafast",   // fastest encode, still good quality reduction
-      "-tune", "fastdecode",
+      "-preset", "ultrafast",
       "-acodec", "aac",
       "-b:a", "128k",
-      "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-      "-f", "mp4",
-      "pipe:1",                  // write to stdout
+      "-movflags", "+faststart",
+      outputPath,
     ]);
 
     let stderr = "";
     ff.stderr.on("data", (c: Buffer) => { stderr += c.toString(); });
 
-    const base = path.basename(req.file.originalname, path.extname(req.file.originalname));
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="${base}_compressed.mp4"`);
-    res.setHeader("X-Original-Size", String(req.file.size));
-    res.setHeader("Transfer-Encoding", "chunked");
-
-    let headersSent = false;
-    let outputBytes = 0;
-
-    ff.stdout.on("data", (chunk: Buffer) => {
-      headersSent = true;
-      outputBytes += chunk.length;
-      res.write(chunk);
-    });
-
-    req.on("close", () => {
-      if (!res.writableEnded) ff.kill("SIGKILL");
-    });
-
     ff.on("close", (code) => {
       cleanup(inputPath);
+      const job = jobs.get(jobId);
+      if (!job) return;
       if (code !== 0) {
-        req.log.error({ stderr: stderr.slice(-800) }, "ffmpeg compress failed");
-        if (!headersSent && !res.headersSent) {
-          res.status(500).json({ error: "Compression failed" });
-        } else {
-          res.end();
-        }
+        req.log.error({ stderr: stderr.slice(-600) }, "ffmpeg compress failed");
+        cleanup(outputPath);
+        job.status = "error";
+        job.error  = "Compression failed";
         return;
       }
-      res.setHeader("X-Compressed-Size", String(outputBytes));
-      req.log.info({ quality, crf, outputBytes }, "compress done");
-      res.end();
+      try {
+        const stat = fs.statSync(outputPath);
+        job.status     = "done";
+        job.outputPath = outputPath;
+        job.outputSize = stat.size;
+      } catch {
+        job.status = "error";
+        job.error  = "Failed to read output";
+        cleanup(outputPath);
+      }
     });
 
     ff.on("error", (err) => {
       req.log.error({ err }, "ffmpeg spawn error");
       cleanup(inputPath);
-      if (!headersSent && !res.headersSent) {
-        res.status(500).json({ error: "Processing not available" });
-      } else {
-        res.end();
-      }
+      const job = jobs.get(jobId);
+      if (job) { job.status = "error"; job.error = "Processing not available"; }
     });
   });
+});
+
+// ── GET /api/job/:id ── poll status ───────────────────────────────────────────
+router.get("/job/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) { res.status(404).json({ error: "Job not found" }); return; }
+  res.json({
+    status:       job.status,
+    originalSize: job.originalSize,
+    outputSize:   job.outputSize,
+    error:        job.error,
+  });
+});
+
+// ── GET /api/job/:id/download ── serve result file ────────────────────────────
+router.get("/job/:id/download", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || job.status !== "done" || !job.outputPath) {
+    res.status(404).json({ error: "File not ready" });
+    return;
+  }
+  try {
+    const stat = fs.statSync(job.outputPath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="${job.basename}_compressed.mp4"`);
+    res.setHeader("Content-Length", String(stat.size));
+    res.setHeader("X-Original-Size",    String(job.originalSize));
+    res.setHeader("X-Compressed-Size",  String(stat.size));
+    const stream = fs.createReadStream(job.outputPath);
+    stream.pipe(res);
+    stream.on("close",  () => { cleanup(job.outputPath!); jobs.delete(req.params.id); });
+    stream.on("error",  () => { if (!res.headersSent) res.status(500).json({ error: "Read error" }); });
+  } catch {
+    res.status(500).json({ error: "File not available" });
+  }
 });
 
 // ── POST /api/split ───────────────────────────────────────────────────────────
 router.post("/split", (req, res) => {
   upload.single("video")(req, res, (uploadErr) => {
     if (uploadErr) {
-      req.log.warn({ err: uploadErr.message }, "upload error");
       if (!res.headersSent) res.status(400).json({ error: uploadErr.message });
       return;
     }
-    if (!req.file) {
-      res.status(400).json({ error: "No video file provided" });
-      return;
-    }
+    if (!req.file) { res.status(400).json({ error: "No video file provided" }); return; }
 
     const startTime = parseFloat(req.body.startTime ?? "0");
     const endTime   = parseFloat(req.body.endTime   ?? "0");
@@ -132,7 +172,6 @@ router.post("/split", (req, res) => {
     const inputPath  = req.file.path;
     const outputPath = path.join(os.tmpdir(), `vc-split-${randomUUID()}.mp4`);
 
-    // -c copy = stream copy, near-instant (no re-encoding needed)
     const ff = spawn("ffmpeg", [
       "-y",
       "-ss", String(startTime),
@@ -160,7 +199,7 @@ router.post("/split", (req, res) => {
         res.setHeader("Content-Type", "video/mp4");
         res.setHeader("Content-Disposition", `attachment; filename="${base}_clip.mp4"`);
         res.setHeader("Content-Length", String(stat.size));
-        res.setHeader("X-Original-Size", String(req.file!.size));
+        res.setHeader("X-Original-Size",   String(req.file!.size));
         res.setHeader("X-Compressed-Size", String(stat.size));
         const stream = fs.createReadStream(outputPath);
         stream.pipe(res);
@@ -168,7 +207,7 @@ router.post("/split", (req, res) => {
         stream.on("error", () => cleanup(outputPath));
       } catch {
         cleanup(outputPath);
-        if (!res.headersSent) res.status(500).json({ error: "Failed to read output file" });
+        if (!res.headersSent) res.status(500).json({ error: "Failed to read output" });
       }
     });
 
