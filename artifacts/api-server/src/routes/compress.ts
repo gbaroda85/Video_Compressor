@@ -18,36 +18,37 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage, limits: { fileSize: 2 * 1024 * 1024 * 1024 } });
 
-const CRF: Record<string, string> = { high: "23", medium: "28", low: "36" };
+// Higher CRF = more compression (smaller file, lower quality)
+const CRF: Record<string, string> = { high: "26", medium: "32", low: "40" };
 
 function cleanup(...files: string[]) {
   for (const f of files) fs.unlink(f, () => {});
 }
 
-// In-memory job store
+// ── In-memory job store ───────────────────────────────────────────────────────
 interface Job {
-  status: "running" | "done" | "error";
-  outputPath?: string;
+  status:       "running" | "done" | "error";
+  outputPath?:  string;
   originalSize: number;
-  outputSize?: number;
-  basename: string;
-  error?: string;
+  outputSize?:  number;
+  basename:     string;
+  error?:       string;
 }
 const jobs = new Map<string, Job>();
 
-// Clean up jobs older than 10 minutes
+// Sweep old completed jobs every 5 minutes
 setInterval(() => {
-  const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [id, job] of jobs) {
     if (job.status !== "running") {
       if (job.outputPath) cleanup(job.outputPath);
       jobs.delete(id);
     }
   }
-  void cutoff;
 }, 5 * 60 * 1000);
 
-// ── POST /api/compress ── starts job, returns jobId immediately ───────────────
+// ── POST /api/compress ────────────────────────────────────────────────────────
+// Accepts upload, starts FFmpeg in background, returns { jobId } immediately.
+// Client polls GET /api/job/:id, then downloads GET /api/job/:id/download.
 router.post("/compress", (req, res) => {
   upload.single("video")(req, res, (uploadErr) => {
     if (uploadErr) {
@@ -59,25 +60,28 @@ router.post("/compress", (req, res) => {
       return;
     }
 
-    const quality    = (req.body.quality as string) ?? "medium";
-    const crf        = CRF[quality] ?? CRF.medium;
-    const inputPath  = req.file.path;
-    const outputPath = path.join(os.tmpdir(), `vc-out-${randomUUID()}.mp4`);
-    const jobId      = randomUUID();
-    const basename   = path.basename(req.file.originalname, path.extname(req.file.originalname));
+    const quality     = (req.body.quality as string) ?? "medium";
+    const crf         = CRF[quality] ?? CRF.medium;
+    const inputPath   = req.file.path;
+    const outputPath  = path.join(os.tmpdir(), `vc-out-${randomUUID()}.mp4`);
+    const jobId       = randomUUID();
+    const basename    = path.basename(req.file.originalname, path.extname(req.file.originalname));
+    const originalSize = req.file.size;
 
-    jobs.set(jobId, { status: "running", originalSize: req.file.size, basename });
+    jobs.set(jobId, { status: "running", originalSize, basename });
 
-    // Return job ID immediately — client will poll
+    // Respond immediately with the job ID
     res.json({ jobId });
 
+    // Encode in background — medium preset gives real size reduction
     const ff = spawn("ffmpeg", [
-      "-y", "-i", inputPath,
+      "-y",
+      "-i", inputPath,
       "-vcodec", "libx264",
       "-crf", crf,
-      "-preset", "ultrafast",
+      "-preset", "medium",      // good compression ratio without being too slow
       "-acodec", "aac",
-      "-b:a", "128k",
+      "-b:a", "96k",
       "-movflags", "+faststart",
       outputPath,
     ]);
@@ -89,6 +93,7 @@ router.post("/compress", (req, res) => {
       cleanup(inputPath);
       const job = jobs.get(jobId);
       if (!job) return;
+
       if (code !== 0) {
         req.log.error({ stderr: stderr.slice(-600) }, "ffmpeg compress failed");
         cleanup(outputPath);
@@ -96,15 +101,27 @@ router.post("/compress", (req, res) => {
         job.error  = "Compression failed";
         return;
       }
+
       try {
         const stat = fs.statSync(outputPath);
+
+        if (stat.size >= originalSize) {
+          // Output is larger — video was already well-compressed (e.g. HEVC, already low bitrate).
+          // Try harder with higher CRF before giving up.
+          cleanup(outputPath);
+          job.status = "error";
+          job.error  = "This video is already highly compressed — reducing it further would lower the quality significantly. Try the 'Max' setting for a smaller file.";
+          return;
+        }
+
         job.status     = "done";
         job.outputPath = outputPath;
         job.outputSize = stat.size;
+        req.log.info({ quality, crf, originalSize, outputSize: stat.size }, "compress done");
       } catch {
-        job.status = "error";
-        job.error  = "Failed to read output";
         cleanup(outputPath);
+        job.status = "error";
+        job.error  = "Failed to read output file";
       }
     });
 
@@ -117,7 +134,7 @@ router.post("/compress", (req, res) => {
   });
 });
 
-// ── GET /api/job/:id ── poll status ───────────────────────────────────────────
+// ── GET /api/job/:id ── poll for status ───────────────────────────────────────
 router.get("/job/:id", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) { res.status(404).json({ error: "Job not found" }); return; }
@@ -129,7 +146,7 @@ router.get("/job/:id", (req, res) => {
   });
 });
 
-// ── GET /api/job/:id/download ── serve result file ────────────────────────────
+// ── GET /api/job/:id/download ── serve finished file ─────────────────────────
 router.get("/job/:id/download", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job || job.status !== "done" || !job.outputPath) {
@@ -138,15 +155,15 @@ router.get("/job/:id/download", (req, res) => {
   }
   try {
     const stat = fs.statSync(job.outputPath);
-    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Type",        "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${job.basename}_compressed.mp4"`);
-    res.setHeader("Content-Length", String(stat.size));
-    res.setHeader("X-Original-Size",    String(job.originalSize));
-    res.setHeader("X-Compressed-Size",  String(stat.size));
+    res.setHeader("Content-Length",      String(stat.size));
+    res.setHeader("X-Original-Size",     String(job.originalSize));
+    res.setHeader("X-Compressed-Size",   String(stat.size));
     const stream = fs.createReadStream(job.outputPath);
     stream.pipe(res);
-    stream.on("close",  () => { cleanup(job.outputPath!); jobs.delete(req.params.id); });
-    stream.on("error",  () => { if (!res.headersSent) res.status(500).json({ error: "Read error" }); });
+    stream.on("close", () => { cleanup(job.outputPath!); jobs.delete(req.params.id); });
+    stream.on("error", () => { if (!res.headersSent) res.status(500).json({ error: "Read error" }); });
   } catch {
     res.status(500).json({ error: "File not available" });
   }
@@ -172,6 +189,7 @@ router.post("/split", (req, res) => {
     const inputPath  = req.file.path;
     const outputPath = path.join(os.tmpdir(), `vc-split-${randomUUID()}.mp4`);
 
+    // -c copy = no re-encoding, near-instant
     const ff = spawn("ffmpeg", [
       "-y",
       "-ss", String(startTime),
@@ -196,11 +214,11 @@ router.post("/split", (req, res) => {
       try {
         const stat = fs.statSync(outputPath);
         const base = path.basename(req.file!.originalname, path.extname(req.file!.originalname));
-        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Content-Type",        "video/mp4");
         res.setHeader("Content-Disposition", `attachment; filename="${base}_clip.mp4"`);
-        res.setHeader("Content-Length", String(stat.size));
-        res.setHeader("X-Original-Size",   String(req.file!.size));
-        res.setHeader("X-Compressed-Size", String(stat.size));
+        res.setHeader("Content-Length",      String(stat.size));
+        res.setHeader("X-Original-Size",     String(req.file!.size));
+        res.setHeader("X-Compressed-Size",   String(stat.size));
         const stream = fs.createReadStream(outputPath);
         stream.pipe(res);
         stream.on("close", () => cleanup(outputPath));
