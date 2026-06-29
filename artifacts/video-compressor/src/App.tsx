@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, createContext, useContext } from "react";
 
+// ── API base URL (empty = same origin on Replit, full URL on Vercel) ──────────
+const API = (import.meta.env.VITE_API_URL ?? "").replace(/\/$/, "");
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 const ThemeCtx = createContext<{ dark: boolean; toggle: () => void }>({ dark: true, toggle: () => {} });
 
@@ -111,12 +114,12 @@ function useJobTool(endpoint:string, mime:string, ext:string) {
         setStage("processing");
         pollRef.current=setInterval(async()=>{
           try{
-            const r=await fetch(`/api/job/${jobId}`);
+            const r=await fetch(`${API}/api/job/${jobId}`);
             const data=await r.json() as{status:string;originalSize:number;outputSize:number;error?:string};
             if(data.status==="done"){
               stopPoll();
               const dl=new XMLHttpRequest();
-              dl.open("GET",`/api/job/${jobId}/download`); dl.responseType="arraybuffer";
+              dl.open("GET",`${API}/api/job/${jobId}/download`); dl.responseType="arraybuffer";
               dl.onload=()=>{
                 if(dl.status===200){
                   const blob=new Blob([dl.response],{type:mime});
@@ -299,7 +302,7 @@ function BusyControls({stage,progress,onCancel}:{stage:Stage;progress:number;onC
 // ── COMPRESS ──────────────────────────────────────────────────────────────────
 function CompressTool() {
   const [quality,setQuality]=useState<Quality>("medium");
-  const t=useJobTool("/api/compress","video/mp4","mp4");
+  const t=useJobTool(`${API}/api/compress`,"video/mp4","mp4");
   const busy=t.stage==="uploading"||t.stage==="processing";
   return(
     <div className="space-y-5">
@@ -354,7 +357,7 @@ function SplitTool() {
     if(!info||startT>=endT){setError("Start time must be before end time.");return;}
     setStage("uploading");setProgress(0);setError("");
     const fd=new FormData();fd.append("video",info.file);fd.append("startTime",String(startT));fd.append("endTime",String(endT));
-    xhrPost("/api/split",fd,p=>{setProgress(p);if(p===100)setStage("processing");},(ok,buf,xhr)=>{
+    xhrPost(`${API}/api/split`,fd,p=>{setProgress(p);if(p===100)setStage("processing");},(ok,buf,xhr)=>{
       if(ok){const blob=new Blob([buf],{type:"video/mp4"});setResult({url:URL.createObjectURL(blob),size:Number(xhr.getResponseHeader("X-Compressed-Size"))||blob.size,originalSize:Number(xhr.getResponseHeader("X-Original-Size"))||info.size,ext:"mp4",mimeType:"video/mp4"});setStage("done");}
       else{let msg="Something went wrong.";try{const j=JSON.parse(new TextDecoder().decode(buf));if(j.error)msg=j.error;}catch{}setError(msg);setStage("ready");}
     },xhrRef);
@@ -403,7 +406,7 @@ function SplitTool() {
 // ── ROTATE ────────────────────────────────────────────────────────────────────
 function RotateTool() {
   const [direction,setDirection]=useState<"cw90"|"ccw90"|"180">("cw90");
-  const t=useJobTool("/api/rotate-video","video/mp4","mp4");
+  const t=useJobTool(`${API}/api/rotate-video`,"video/mp4","mp4");
   const busy=t.stage==="uploading"||t.stage==="processing";
 
   const DIRS: {id:"cw90"|"ccw90"|"180"; label:string; icon:string}[] = [
@@ -460,7 +463,7 @@ function WatermarkTool() {
   const [position,setPosition]=useState("bottom-right");
   const [size,setSize]=useState("medium");
   const [opacity,setOpacity]=useState(0.7);
-  const t=useJobTool("/api/watermark-video","video/mp4","mp4");
+  const t=useJobTool(`${API}/api/watermark-video`,"video/mp4","mp4");
   const busy=t.stage==="uploading"||t.stage==="processing";
 
   return(
@@ -570,8 +573,8 @@ function AppInner() {
         <main className="max-w-xl mx-auto px-4 sm:px-6 py-8">
           {active==="compress"  &&<CompressTool/>}
           {active==="split"     &&<SplitTool/>}
-          {active==="audio"     &&<SimpleToolUI endpoint="/api/extract-audio" mime="audio/mpeg" ext="mp3" buttonLabel="Extract Audio" outSuffix="audio"/>}
-          {active==="mute"      &&<SimpleToolUI endpoint="/api/mute-video"    mime="video/mp4"  ext="mp4" buttonLabel="Remove Audio"  outSuffix="muted"/>}
+          {active==="audio"     &&<SimpleToolUI endpoint={`${API}/api/extract-audio`} mime="audio/mpeg" ext="mp3" buttonLabel="Extract Audio" outSuffix="audio"/>}
+          {active==="mute"      &&<SimpleToolUI endpoint={`${API}/api/mute-video`}    mime="video/mp4"  ext="mp4" buttonLabel="Remove Audio"  outSuffix="muted"/>}
           {active==="rotate"    &&<RotateTool/>}
           {active==="watermark" &&<WatermarkTool/>}
         </main>
