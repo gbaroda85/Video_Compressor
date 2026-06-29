@@ -58,7 +58,7 @@ const Q: Record<Quality,{label:string;tag:string}> = {
 interface VInfo { file:File; url:string; size:number; name:string; duration:number }
 interface Result { url:string; size:number; originalSize:number; ext:string; mimeType:string }
 
-const TOOLS: { id:Tab; icon:JSX.Element; title:string; desc:string; color:string }[] = [
+const TOOLS: { id:Tab; icon:React.ReactNode; title:string; desc:string; color:string }[] = [
   { id:"compress",  color:"from-violet-600 to-purple-700", title:"Compress",      desc:"Shrink video size without visible quality loss",
     icon:<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M17 10l-5 5-5-5"/><line x1="12" y1="3" x2="12" y2="15"/></svg> },
   { id:"split",     color:"from-blue-600 to-indigo-700",   title:"Trim / Split",  desc:"Cut any segment from your video precisely",

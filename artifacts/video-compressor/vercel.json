@@ -1,0 +1,12 @@
+{
+  "buildCommand": "cd ../.. && pnpm --filter @workspace/video-compressor run build",
+  "outputDirectory": "dist/public",
+  "installCommand": "cd ../.. && pnpm install",
+  "framework": null,
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "env": {
+    "BASE_PATH": "/"
+  }
+}
